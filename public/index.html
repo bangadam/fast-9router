@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#FDFAF6" />
+  <title>Fast 9Router</title>
+  <script>
+    (() => {
+      const value = localStorage.getItem("fast9r-theme");
+      const dark = value === "dark" || (value !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.classList.toggle("dark", dark);
+      document.documentElement.dataset.theme = value === "light" || value === "dark" ? value : "system";
+    })();
+  </script>
+  <script type="module" crossorigin src="./assets/index-UIQklvWc.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-BYkEtZPq.css">
+</head>
+<body>
+  <div id="root"></div>
+</body>
+</html>

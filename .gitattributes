@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.png binary
+bun.lock linguist-generated=false
+public/assets/* linguist-generated=true

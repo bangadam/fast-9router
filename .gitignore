@@ -1,0 +1,31 @@
+# Dependencies and tool caches
+node_modules/
+.vite/
+coverage/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state
+*.db
+*.db-*
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# Local reports and OS/editor files
+benchmark-result.json
+.DS_Store
+.idea/
+.vscode/
+*.swp
