@@ -1,5 +1,5 @@
 import "./styles.css";
-import { render } from "preact";
+import { createRoot } from "react-dom/client";
 import { App } from "./app.tsx";
 
-render(<App />, document.getElementById("root")!);
+createRoot(document.getElementById("root")!).render(<App />);

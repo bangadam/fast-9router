@@ -63,7 +63,7 @@ describe("legacy usage live flow", () => {
     const body = JSON.parse(text);
 
     expect(response.status).toBe(200);
-    expect(body.details).toEqual([expect.objectContaining({ model: "cx/a", endpoint: "/v1/responses", connectionName: "codex", latencyMs: 9, ttftMs: null, keyName: "Local (No API Key)" })]);
+    expect(body.details).toEqual([expect.objectContaining({ model: "cx/a", endpoint: "/v1/responses", connectionName: "codex", latencyMs: 9, ttftMs: null, keyCategory: "local", gatewayKeyId: "", gatewayKeyName: "Local (No API Key)" })]);
     expect(text).not.toContain("prompt\"");
     expect(text).not.toContain("responseBody");
   });

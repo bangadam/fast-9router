@@ -10,8 +10,11 @@ import {
   getSettings,
   listAliases,
   recordUsage,
+  LOCAL_KEY_IDENTITY,
   type ProviderConnectionWithCooldown,
+  type UsageKeyIdentity,
 } from "../db.ts";
+import { applyTokenSaverTransforms } from "../token-saver.ts";
 import type { Logger } from "../log.ts";
 import {
   fromOpenaiChatRequest,
@@ -302,6 +305,14 @@ async function bufferStreamToFinal(
 // The pipeline
 // ---------------------------------------------------------------------------
 
+export interface RouteRequestOptions {
+  signal?: AbortSignal;
+  upstreamConnectTimeoutMs?: number;
+  onlyConnectionIds?: readonly number[];
+  usageKeyIdentity?: UsageKeyIdentity;
+  tokenSaverEnabled?: boolean;
+}
+
 /**
  * Full routing pipeline for a generation endpoint. `body` is the parsed JSON
  * client payload. Never throws: errors come back as error Responses.
@@ -311,11 +322,12 @@ export async function routeGenerationRequest(
   logger: Logger,
   endpoint: Endpoint,
   body: Record<string, unknown>,
-  signal?: AbortSignal,
-  upstreamConnectTimeoutMs = DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
-  onlyConnectionIds?: readonly number[],
-  keyName = "Local (No API Key)",
+  options: RouteRequestOptions = {},
 ): Promise<Response> {
+  const { signal, onlyConnectionIds } = options;
+  const upstreamConnectTimeoutMs = options.upstreamConnectTimeoutMs ?? DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS;
+  const usageKey = options.usageKeyIdentity ?? LOCAL_KEY_IDENTITY;
+  const tokenSaverEnabled = options.tokenSaverEnabled ?? true;
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   const clientFormat = CLIENT_FORMATS[endpoint];
@@ -340,6 +352,9 @@ export async function routeGenerationRequest(
     return errorJson(400, `invalid request payload: ${(err as Error).message}`, "invalid_request_error");
   }
   if (selection.effort) normalized.reasoning = { ...(normalized.reasoning ?? {}), effort: selection.effort };
+  // Token Saver runs exactly once after normalization, before account
+  // fallback, so retries cannot double-compress or double-inject.
+  if (tokenSaverEnabled) applyTokenSaverTransforms(db, logger, normalized);
 
   const liveRequestId = beginActiveRequest(resolved.prefix ?? resolved.provider, resolved.canonical, 0);
   const customToolNames = new Set(
@@ -467,7 +482,7 @@ export async function routeGenerationRequest(
         endpoint,
         status: e.status,
         latencyMs: Date.now() - startedAt,
-        keyName,
+        usageKey,
       });
     }
     endActiveRequest(liveRequestId, true);
@@ -505,7 +520,7 @@ export async function routeGenerationRequest(
       latencyMs: Date.now() - startedAt,
       ttftMs,
       failed,
-      keyName,
+      usageKey,
     });
     endActiveRequest(liveRequestId, failed);
     logger.request({

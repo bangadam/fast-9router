@@ -4,6 +4,17 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { makeApp, adminGet, adminJson } from "./helpers.ts";
 
+import type { App } from "../src/app.ts";
+
+async function testSessionCookie(app: App): Promise<string> {
+  const login = await app.fetch(new Request("http://localhost/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1" },
+    body: JSON.stringify({ password: "123456" }),
+  }));
+  return login.headers.get("set-cookie")!.split(";")[0]!;
+}
+
 const contexts: Array<ReturnType<typeof makeApp>> = [];
 function ctx() {
   const c = makeApp();
@@ -497,7 +508,7 @@ describe("admin connections CRUD", () => {
     const res = await app.fetch(
       new Request("http://localhost/api/admin/connections", {
         method: "POST",
-        headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1" },
+        headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1", cookie: await testSessionCookie(app) },
         body: "{not json",
       }),
     );
@@ -516,13 +527,14 @@ describe("admin connections CRUD", () => {
 
   test("all connection action routes reject malformed IDs", async () => {
     const { app } = ctx();
+    const cookie = await testSessionCookie(app);
     const requests = [
-      new Request("http://localhost/api/admin/connections/abc", { headers: { "x-test-peer": "127.0.0.1" } }),
-      new Request("http://localhost/api/admin/connections/1.5", { method: "PATCH", headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1" }, body: "{}" }),
-      new Request("http://localhost/api/admin/connections/0/activate", { method: "POST", headers: { "x-test-peer": "127.0.0.1" } }),
-      new Request("http://localhost/api/admin/connections/-1/deactivate", { method: "POST", headers: { "x-test-peer": "127.0.0.1" } }),
-      new Request("http://localhost/api/admin/connections/9007199254740992/test", { method: "POST", headers: { "x-test-peer": "127.0.0.1" } }),
-      new Request("http://localhost/api/admin/connections/NaN", { method: "DELETE", headers: { "x-test-peer": "127.0.0.1" } }),
+      new Request("http://localhost/api/admin/connections/abc", { headers: { "x-test-peer": "127.0.0.1", cookie } }),
+      new Request("http://localhost/api/admin/connections/1.5", { method: "PATCH", headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1", cookie }, body: "{}" }),
+      new Request("http://localhost/api/admin/connections/0/activate", { method: "POST", headers: { "x-test-peer": "127.0.0.1", cookie } }),
+      new Request("http://localhost/api/admin/connections/-1/deactivate", { method: "POST", headers: { "x-test-peer": "127.0.0.1", cookie } }),
+      new Request("http://localhost/api/admin/connections/9007199254740992/test", { method: "POST", headers: { "x-test-peer": "127.0.0.1", cookie } }),
+      new Request("http://localhost/api/admin/connections/NaN", { method: "DELETE", headers: { "x-test-peer": "127.0.0.1", cookie } }),
     ];
 
     for (const request of requests) {
@@ -717,8 +729,9 @@ describe("admin browser origin protection", () => {
 
   test("same-origin loopback browser request and origin-less CLI request remain allowed", async () => {
     const { app } = ctx();
+    const cookie = await testSessionCookie(app);
     const browser = await app.fetch(new Request("http://localhost/api/admin/status", {
-      headers: { origin: "http://localhost", "x-test-peer": "127.0.0.1" },
+      headers: { origin: "http://localhost", "x-test-peer": "127.0.0.1", cookie },
     }));
     const cli = await adminGet(app, "/api/admin/status");
 

@@ -1,5 +1,6 @@
-Codex, Anthropic, and OpenAI provider icons copied from:
+Provider and CLI tool icons copied from:
 https://github.com/decolua/9router
 
 Licensed under the MIT License.
 Copyright 2024-2026 decolua and contributors.
+Also served into the built dashboard via the Vite publicDir.

@@ -4,10 +4,10 @@
 // The app is constructed with an open Database handle; `app.fetch` is the
 // testing seam.
 
-import { timingSafeEqual } from "node:crypto";
 import { Hono, type Context, type Env } from "hono";
 import { cors } from "hono/cors";
 import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
   RESERVED_PREFIXES,
   CATALOGS,
@@ -28,13 +28,25 @@ import {
   upsertAlias,
   deleteAlias,
   getSettings,
-  setGatewayKey,
+  updateTokenSaverSettings,
   setGatewayEnforce,
   setModelsDisabled,
   usageSummary,
   requestUsageDetails,
+  countActiveGatewayKeys,
+  listGatewayKeyDtos,
+  createGatewayKey,
+  updateGatewayKey,
+  deleteGatewayKey,
+  getGatewayKey,
+  gatewayKeyNameTaken,
+  validateGatewayKeyName,
+  findActiveGatewayKeyByHash,
+  LOCAL_KEY_IDENTITY,
   type ConnectionData,
   type ProviderConnectionWithCooldown,
+  type UsageKeyIdentity,
+  type GatewayApiKeyRow,
 } from "./db.ts";
 import { Logger, redact } from "./log.ts";
 import { recoverConnectionHealth } from "./router/accounts.ts";
@@ -46,7 +58,7 @@ import {
   exchangeCodeForTokens,
   defaultRedirectUri,
 } from "./oauth/codex.ts";
-import { canonicalBaseUrl, fetchAuthenticated, isLoopbackAddress, isLoopbackHostname, isValidGatewayKey } from "./network.ts";
+import { canonicalBaseUrl, fetchAuthenticated, isLoopbackAddress, isLoopbackHostname } from "./network.ts";
 import { testCodexConnection } from "./adapters/codex.ts";
 import { isJsonResponse } from "./adapters/types.ts";
 import { readBodyTextLimited, type BodyTextResult } from "./body.ts";
@@ -57,17 +69,22 @@ import {
 } from "./oauth/codex-proxy.ts";
 import { readResponseTextLimited, safeUpstreamMessage, sanitizeErrorText } from "./upstream-error.ts";
 import { buildUsageAnalytics, type UsagePeriod } from "./analytics.ts";
-
+import { createCliToolsApp } from "./cli-tools/routes.ts";
 import { liveUsageSnapshot, subscribeUsageChanges } from "./usage-live.ts";
+import { validateConnectionInput, validateBaseUrl } from "./connection-input.ts";
+import { exportBackup, importBackup, validateBackupPayload } from "./backup.ts";
+import { quotaSnapshotForConnection, quotaOverview } from "./quota.ts";
+import * as auth from "./auth.ts";
+
 export interface AppEnv extends Env {
   Variables: {
     db: Database;
     logger: Logger;
+    usageKey?: UsageKeyIdentity;
   };
 }
 
 export type App = Hono<AppEnv>;
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -150,150 +167,9 @@ function connectionTestResponse(
 }
 
 // ---------------------------------------------------------------------------
-// Validation
+// Validation (see connection-input.ts — shared with backup import)
 // ---------------------------------------------------------------------------
 
-
-/** Base URL rules: http(s) only, no username/password/fragment/query. */
-export function validateBaseUrl(raw: unknown): string | null {
-  if (typeof raw !== "string") return "base URL must be a string";
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return "base URL must be a valid absolute http(s) URL";
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    return "base URL must use http or https";
-  }
-  if (url.username || url.password) return "base URL must not contain credentials";
-  if (url.hash) return "base URL must not contain a fragment";
-  if (url.search) return "base URL must not contain a query string";
-  return null;
-}
-
-
-/** Compatible prefix syntax and upstream-consistency rules. */
-export function validatePrefix(
-  prefix: unknown,
-  db: Database,
-  baseUrl: string,
-  excludeConnectionId?: number,
-): string | null {
-  if (typeof prefix !== "string" || prefix === "") {
-    return "prefix is required for openai-compatible connections";
-  }
-  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(prefix)) {
-    return "prefix must be 1-32 chars of lowercase letters, digits, or dashes";
-  }
-  // cx/anthropic belong to the fixed providers; `oa` is the official [OI]
-  // preset namespace and is allowed.
-  if (prefix === "cx" || prefix === "anthropic") {
-    return `prefix '${prefix}' is reserved`;
-  }
-  const normalizedBaseUrl = canonicalBaseUrl(baseUrl);
-  if (prefix === "oa" && normalizedBaseUrl !== canonicalBaseUrl(OPENAI_PRESET_BASE_URL)) {
-    return "prefix 'oa' is reserved for the official OpenAI endpoint";
-  }
-  const conflict = listConnections(db).find(
-    (connection) =>
-      connection.id !== excludeConnectionId &&
-      connection.provider === "openai" &&
-      connection.data.prefix === prefix &&
-      canonicalBaseUrl(connection.data.baseUrl ?? OPENAI_PRESET_BASE_URL) !== normalizedBaseUrl,
-  );
-  if (conflict) return `prefix '${prefix}' is already assigned to a different upstream`;
-  return null;
-}
-
-const PROVIDER_DATA_KEYS = {
-  codex: ["accessToken", "refreshToken", "idToken", "expiresAt", "accountId", "email", "planType", "models", "autoPing"],
-  anthropic: ["apiKey", "baseUrl", "models", "autoPing"],
-  openai: ["apiKey", "baseUrl", "prefix", "models", "autoPing"],
-} as const;
-
-function validateConnectionInput(
-  db: Database,
-  body: Record<string, unknown>,
-  existing?: ProviderConnectionWithCooldown,
-): { error: string } | { data: ConnectionData; provider: string; name: string; isActive: boolean; priority: number } {
-  if (existing && body.provider !== undefined && body.provider !== existing.provider) {
-    return { error: "connection provider cannot be changed" };
-  }
-  const provider = body.provider ?? existing?.provider;
-  if (provider !== "codex" && provider !== "anthropic" && provider !== "openai") {
-    return { error: "provider must be one of codex, anthropic, openai" };
-  }
-  const name = body.name ?? existing?.name;
-  if (typeof name !== "string" || name.trim() === "") return { error: "name is required" };
-  if (body.isActive !== undefined && typeof body.isActive !== "boolean") {
-    return { error: "isActive must be a boolean" };
-  }
-  const priority = body.priority ?? existing?.priority ?? 0;
-  if (typeof priority !== "number" || !Number.isSafeInteger(priority)) {
-    return { error: "priority must be an integer" };
-  }
-
-  const rawDataValue = body.data;
-  if (rawDataValue !== undefined && (rawDataValue === null || typeof rawDataValue !== "object" || Array.isArray(rawDataValue))) {
-    return { error: "data must be a JSON object" };
-  }
-  const rawData = { ...((rawDataValue ?? {}) as Record<string, unknown>) };
-  const allowedDataKeys = PROVIDER_DATA_KEYS[provider] as readonly string[];
-  const unsupportedKey = Object.keys(rawData).find((key) => !allowedDataKeys.includes(key));
-  if (unsupportedKey) {
-    return { error: `unsupported ${provider} connection data field: ${unsupportedKey}` };
-  }
-
-  if (rawData.apiKey === MASK) {
-    if (!existing?.data.apiKey) return { error: "masked API key sentinel cannot be stored" };
-    delete rawData.apiKey;
-  }
-
-  const existingData = Object.fromEntries(
-    Object.entries(existing?.data ?? {}).filter(([key]) => allowedDataKeys.includes(key)),
-  );
-  const merged = { ...existingData, ...rawData } as Record<string, unknown>;
-  if (rawData.apiKey === null) delete merged.apiKey;
-  for (const key of ["apiKey", "accessToken", "refreshToken", "idToken", "accountId", "email", "planType"] as const) {
-    if (merged[key] !== undefined && typeof merged[key] !== "string") {
-      return { error: `${key} must be a string` };
-    }
-  }
-  if (merged.expiresAt !== undefined && (typeof merged.expiresAt !== "number" || !Number.isFinite(merged.expiresAt))) {
-    return { error: "expiresAt must be a finite number" };
-  }
-  if (merged.baseUrl !== undefined) {
-    const baseUrlError = validateBaseUrl(merged.baseUrl);
-    if (baseUrlError) return { error: baseUrlError };
-    merged.baseUrl = canonicalBaseUrl(merged.baseUrl as string);
-  }
-  if (merged.models !== undefined) {
-    if (!Array.isArray(merged.models) || merged.models.some((model) => typeof model !== "string" || model.trim() === "")) {
-      return { error: "models must be an array of non-empty strings" };
-    }
-    merged.models = [...new Set(merged.models.map((model) => model.trim()))];
-  }
-  if (merged.autoPing !== undefined && typeof merged.autoPing !== "boolean") {
-    return { error: "autoPing must be a boolean" };
-  }
-  if (provider === "openai") {
-    merged.baseUrl ??= OPENAI_PRESET_BASE_URL;
-    if (typeof merged.baseUrl !== "string") return { error: "base URL must be a string" };
-    const prefixError = validatePrefix(merged.prefix, db, merged.baseUrl, existing?.id);
-    if (prefixError) return { error: prefixError };
-  }
-
-  // All ConnectionData fields have been narrowed above.
-  const data = merged as ConnectionData;
-  return {
-    provider,
-    name: name.trim(),
-    isActive: body.isActive !== undefined ? body.isActive : (existing ? existing.isActive === 1 : true),
-    priority,
-    data,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Model listing
@@ -440,12 +316,37 @@ function bearerToken(authorization: string | undefined): string | null {
   return match?.[1] ?? null;
 }
 
-function gatewayKeyMatches(candidate: string | null, expected: string): boolean {
-  if (candidate === null) return false;
-  const candidateBytes = Buffer.from(candidate);
-  const expectedBytes = Buffer.from(expected);
-  return candidateBytes.length === expectedBytes.length
-    && timingSafeEqual(candidateBytes, expectedBytes);
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+/**
+ * Resolve the gateway credential from a request: strict Bearer token first,
+ * then a non-empty `x-api-key`. Returns the active key row on match, or a
+ * response to return immediately on failure. Enforcement off bypasses lookup.
+ */
+function resolveGatewayCredential(
+  db: Database,
+  request: Request,
+): { key: GatewayApiKeyRow } | { response: Response } {
+  const settings = getSettings(db);
+  if (!settings.gatewayEnforce) {
+    return { response: new Response(null, { status: 0 }) }; // sentinel: pass through as local
+  }
+  const bearer = bearerToken(request.headers.get("authorization") ?? undefined);
+  const apiKeyHeader = request.headers.get("x-api-key");
+  const candidate = bearer !== null ? bearer : (apiKeyHeader !== null && apiKeyHeader.trim() !== "" ? apiKeyHeader.trim() : null);
+  if (countActiveGatewayKeys(db) === 0) {
+    return { response: jsonError(503, "gateway authentication is misconfigured", "server_error") };
+  }
+  if (candidate === null) {
+    return { response: jsonError(401, "invalid or missing gateway API key", "invalid_request_error") };
+  }
+  const key = findActiveGatewayKeyByHash(db, sha256Hex(candidate));
+  if (!key) {
+    return { response: jsonError(401, "invalid or missing gateway API key", "invalid_request_error") };
+  }
+  return { key };
 }
 
 export function createApp(
@@ -468,20 +369,23 @@ export function createApp(
   app.use("/v1/*", cors({
     origin: "*",
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["authorization", "content-type"],
+    allowHeaders: ["authorization", "content-type", "x-api-key", "x-9router-token-saver"],
   }));
 
   // --- Gateway auth ---------------------------------------------------------
   app.use("/v1/*", async (c, next) => {
     const settings = getSettings(db);
-    if (!settings.gatewayEnforce) return next();
-    if (!isValidGatewayKey(settings.gatewayKey)) {
-      return jsonError(503, "gateway authentication is misconfigured", "server_error");
+    if (!settings.gatewayEnforce) {
+      c.set("usageKey", LOCAL_KEY_IDENTITY);
+      return next();
     }
-    const token = bearerToken(c.req.header("authorization"));
-    if (!gatewayKeyMatches(token, settings.gatewayKey)) {
-      return jsonError(401, "invalid or missing gateway API key", "invalid_request_error");
-    }
+    const resolved = resolveGatewayCredential(db, c.req.raw);
+    if ("response" in resolved) return resolved.response;
+    c.set("usageKey", {
+      category: "gateway",
+      gatewayKeyId: resolved.key.id,
+      gatewayKeyName: resolved.key.name,
+    });
     return next();
   });
 
@@ -516,29 +420,89 @@ export function createApp(
     if (body === null || typeof body !== "object" || Array.isArray(body)) {
       return jsonError(400, "request body must be a JSON object", "invalid_request_error");
     }
-    const keyName = getSettings(c.get("db")).gatewayEnforce ? "Gateway API Key" : "Local (No API Key)";
-    return routeGenerationRequest(
-      c.get("db"),
-      c.get("logger"),
-      endpoint,
-      body,
-      c.req.raw.signal,
-      policy.upstreamConnectTimeoutMs,
-      undefined,
-      keyName,
-    );
+    const tokenSaverHeader = c.req.header("x-9router-token-saver");
+    const tokenSaverEnabled = tokenSaverHeader?.toLowerCase() !== "off";
+    return routeGenerationRequest(c.get("db"), c.get("logger"), endpoint, body, {
+      signal: c.req.raw.signal,
+      upstreamConnectTimeoutMs: policy.upstreamConnectTimeoutMs,
+      usageKeyIdentity: c.get("usageKey") ?? LOCAL_KEY_IDENTITY,
+      tokenSaverEnabled,
+    });
   };
   app.post("/v1/chat/completions", generationEndpoint("/v1/chat/completions"));
   app.post("/v1/responses", generationEndpoint("/v1/responses"));
   app.post("/v1/messages", generationEndpoint("/v1/messages"));
 
-  // Browser calls must also be same-origin. A hostile website can connect to
-  // 127.0.0.1, so peer-loopback alone is not a CSRF boundary. Origin-less
-  // local CLI requests remain supported.
-  app.use("/api/admin/*", async (c, next) => {
+  // --- Public auth routes (loopback/same-origin guarded) ---------------------
+  // Ordered checks: every /api/auth/* and /api/admin/* request first requires
+  // a resolved loopback peer and a same-origin browser request.
+  const loopbackGuard = async (c: Context<AppEnv>, next: () => Promise<void>) => {
     const peer = resolvePeer(c);
     if (!peer || !isLoopbackAddress(peer) || !allowsAdminBrowserRequest(c.req.raw)) {
       return jsonError(403, "dashboard administration is restricted to same-origin loopback clients", "forbidden");
+    }
+    await next();
+  };
+  app.use("/api/auth/*", loopbackGuard);
+
+  app.get("/api/auth/status", (c) => {
+    const session = auth.resolveSession(db, c.req.header("cookie"));
+    const { passwordHash } = getSettings(db);
+    return Response.json(
+      {
+        authenticated: session !== null,
+        hasPassword: passwordHash !== "",
+        usesDefaultPassword: passwordHash === "",
+        expiresAt: session?.expiresAt ?? null,
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
+  });
+
+  app.post("/api/auth/login", async (c) => {
+    const peer = resolvePeer(c) ?? "unknown";
+    const lock = auth.checkLock(peer);
+    if (lock.locked) {
+      return new Response(
+        JSON.stringify({ error: { message: "too many failed login attempts; try again later", type: "rate_limited" } }),
+        { status: 429, headers: { "content-type": "application/json", "retry-after": String(lock.retryAfterSeconds ?? 30) } },
+      );
+    }
+    const body = await c.req.json().catch(() => null) as { password?: unknown } | null;
+    if (body === null || typeof body.password !== "string") {
+      return jsonError(400, "request body must include a password string", "invalid_request_error");
+    }
+    const check = await auth.verifyDashboardPassword(db, body.password);
+    if (!check.ok) {
+      auth.recordLoginFail(peer);
+      return jsonError(401, "invalid password", "unauthorized");
+    }
+    auth.recordLoginSuccess(peer);
+    const session = auth.issueSession(db);
+    return Response.json(
+      { authenticated: true, expiresAt: session.expiresAt },
+      { headers: auth.sessionCookieHeaders(session.token, c.req.url) },
+    );
+  });
+
+  app.post("/api/auth/logout", (c) => {
+    auth.revokeSession(db, c.req.header("cookie"));
+    return c.body(null, 204, auth.expiredCookieHeader());
+  });
+
+  // Browser calls must also be same-origin. A hostile website can connect to
+  // 127.0.0.1, so peer-loopback alone is not a CSRF boundary. Origin-less
+  // local CLI requests remain supported.
+  app.use("/api/admin/*", loopbackGuard);
+  // Every admin request (except the one-time OAuth callback, whose state is
+  // consumed by consumeState) requires a valid dashboard session.
+  app.use("/api/admin/*", async (c, next) => {
+    if (c.req.method === "GET" && new URL(c.req.url).pathname === "/api/admin/oauth/codex/callback") {
+      return next();
+    }
+    const session = auth.resolveSession(db, c.req.header("cookie"));
+    if (session === null) {
+      return jsonError(401, "dashboard session required", "unauthorized");
     }
     return next();
   });
@@ -645,7 +609,7 @@ export function createApp(
   admin.post("/connections", async (c) => {
     const body = await c.req.json().catch(() => null);
     if (body === null || typeof body !== "object") return jsonError(400, "request body must be JSON", "invalid_request_error");
-    const result = validateConnectionInput(c.get("db"), body as Record<string, unknown>);
+    const result = validateConnectionInput(listConnections(c.get("db")), body as Record<string, unknown>);
     if ("error" in result) return jsonError(400, result.error, "invalid_request_error");
     const conn = createConnection(c.get("db"), result);
     return Response.json({ connection: maskConnection(conn) }, { status: 201 });
@@ -658,7 +622,7 @@ export function createApp(
     if (!existing) return jsonError(404, "connection not found", "not_found");
     const body = await c.req.json().catch(() => null);
     if (body === null || typeof body !== "object") return jsonError(400, "request body must be JSON", "invalid_request_error");
-    const result = validateConnectionInput(c.get("db"), body as Record<string, unknown>, existing);
+    const result = validateConnectionInput(listConnections(c.get("db")), body as Record<string, unknown>, existing);
     if ("error" in result) return jsonError(400, result.error, "invalid_request_error");
     const conn = updateConnection(c.get("db"), id, result);
     const changedDataKeys = body !== null && typeof body === "object" && "data" in body && body.data && typeof body.data === "object"
@@ -838,27 +802,82 @@ export function createApp(
       ? c.body(null, 204)
       : jsonError(404, "alias not found", "not_found"));
 
-  // Gateway settings
+  // Gateway settings + named API keys
   admin.get("/gateway", (c) => {
     const s = getSettings(c.get("db"));
-    const keyConfigured = isValidGatewayKey(s.gatewayKey);
     return Response.json({
       enforce: s.gatewayEnforce,
-      keyConfigured,
-      keyMasked: keyConfigured ? MASK : null,
       enforceRequired: policy.gatewayEnforcementRequired === true,
+      keys: listGatewayKeyDtos(c.get("db")),
     });
   });
 
-  admin.put("/gateway/key", async (c) => {
+  admin.post("/gateway/keys", async (c) => {
     const body = await c.req.json().catch(() => null);
-    const key = (body as { key?: unknown } | null)?.key;
-    const normalizedKey = typeof key === "string" ? key.trim() : "";
-    if (!isValidGatewayKey(normalizedKey)) {
-      return jsonError(400, "gateway key must be a non-empty string of at least 8 characters", "invalid_request_error");
+    const name = (body as { name?: unknown } | null)?.name;
+    const nameError = validateGatewayKeyName(name);
+    if (nameError) return jsonError(400, nameError, "invalid_request_error");
+    const trimmed = (name as string).trim();
+    if (gatewayKeyNameTaken(c.get("db"), trimmed)) {
+      return jsonError(409, "a gateway key with that name already exists", "invalid_request_error");
     }
-    setGatewayKey(c.get("db"), normalizedKey);
-    return Response.json({ ok: true });
+    const created = createGatewayKey(c.get("db"), trimmed);
+    // The raw secret appears in this response alone and is never persisted.
+    return Response.json(created, { status: 201 });
+  });
+
+  admin.patch("/gateway/keys/:id", async (c) => {
+    const id = c.req.param("id");
+    const db = c.get("db");
+    const existing = getGatewayKey(db, id);
+    if (!existing) return jsonError(404, "gateway key not found", "not_found");
+    const body = await c.req.json().catch(() => null);
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return jsonError(400, "request body must be JSON", "invalid_request_error");
+    }
+    const patch: { name?: string; isActive?: boolean } = {};
+    let provided = 0;
+    if ("name" in body) {
+      const nameError = validateGatewayKeyName((body as Record<string, unknown>).name);
+      if (nameError) return jsonError(400, nameError, "invalid_request_error");
+      const trimmed = ((body as Record<string, unknown>).name as string).trim();
+      if (gatewayKeyNameTaken(db, trimmed, id)) {
+        return jsonError(409, "a gateway key with that name already exists", "invalid_request_error");
+      }
+      patch.name = trimmed;
+      provided++;
+    }
+    if ("isActive" in body) {
+      const isActive = (body as Record<string, unknown>).isActive;
+      if (typeof isActive !== "boolean") {
+        return jsonError(400, "isActive must be a boolean", "invalid_request_error");
+      }
+      if (!isActive && existing.isActive === 1 && getSettings(db).gatewayEnforce && countActiveGatewayKeys(db) <= 1) {
+        return jsonError(409, "create another active key or disable enforcement first", "invalid_request_error");
+      }
+      patch.isActive = isActive;
+      provided++;
+    }
+    if (provided === 0) {
+      return jsonError(400, "provide at least one of name or isActive", "invalid_request_error");
+    }
+    const updated = updateGatewayKey(db, id, patch);
+    return updated
+      ? Response.json({ key: { id: updated.id, name: updated.name, keyMasked: `${updated.secretPrefix}••••${updated.secretSuffix}`, isActive: updated.isActive === 1, createdAt: updated.createdAt, updatedAt: updated.updatedAt } })
+      : jsonError(404, "gateway key not found", "not_found");
+  });
+
+  admin.delete("/gateway/keys/:id", (c) => {
+    const id = c.req.param("id");
+    const db = c.get("db");
+    const existing = getGatewayKey(db, id);
+    if (!existing) return jsonError(404, "gateway key not found", "not_found");
+    if (existing.isActive === 1 && getSettings(db).gatewayEnforce && countActiveGatewayKeys(db) <= 1) {
+      return jsonError(409, "create another active key or disable enforcement first", "invalid_request_error");
+    }
+    return deleteGatewayKey(db, id)
+      ? c.body(null, 204)
+      : jsonError(404, "gateway key not found", "not_found");
   });
 
   admin.put("/gateway/enforce", async (c) => {
@@ -868,8 +887,8 @@ export function createApp(
     if (!enforce && policy.gatewayEnforcementRequired) {
       return jsonError(400, "gateway enforcement is required for the active non-loopback listener", "invalid_request_error");
     }
-    if (enforce && !isValidGatewayKey(getSettings(c.get("db")).gatewayKey)) {
-      return jsonError(400, "cannot enable enforcement without a valid gateway key", "invalid_request_error");
+    if (enforce && countActiveGatewayKeys(c.get("db")) === 0) {
+      return jsonError(400, "cannot enable enforcement without an active gateway key", "invalid_request_error");
     }
     setGatewayEnforce(c.get("db"), enforce);
     return Response.json({ ok: true });
@@ -986,8 +1005,172 @@ export function createApp(
     return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
   });
 
+  // --- Profile password ------------------------------------------------------
+  admin.patch("/profile/password", async (c) => {
+    const body = await c.req.json().catch(() => null) as { currentPassword?: unknown; newPassword?: unknown } | null;
+    if (body === null || typeof body.currentPassword !== "string" || typeof body.newPassword !== "string") {
+      return jsonError(400, "currentPassword and newPassword are required strings", "invalid_request_error");
+    }
+    const db = c.get("db");
+    const peer = resolvePeer(c) ?? "unknown";
+    const lock = auth.checkLock(peer);
+    if (lock.locked) {
+      return new Response(
+        JSON.stringify({ error: { message: "too many failed attempts; try again later", type: "rate_limited" } }),
+        { status: 429, headers: { "content-type": "application/json", "retry-after": String(lock.retryAfterSeconds ?? 30) } },
+      );
+    }
+    const current = await auth.verifyDashboardPassword(db, body.currentPassword);
+    const result = await auth.changeDashboardPassword(db, current.ok, body.newPassword);
+    if (!result.ok) {
+      if (result.status === 401) auth.recordLoginFail(peer);
+      return jsonError(result.status, result.error, result.status === 401 ? "unauthorized" : "invalid_request_error");
+    }
+    auth.recordLoginSuccess(peer);
+    return Response.json(
+      { success: true, expiresAt: result.expiresAt },
+      { headers: auth.sessionCookieHeaders(result.token, c.req.url) },
+    );
+  });
+
+  // --- Token Saver -----------------------------------------------------------
+  admin.get("/token-saver", (c) => {
+    const s = getSettings(c.get("db"));
+    return Response.json({
+      rtkEnabled: s.rtkEnabled,
+      cavemanEnabled: s.cavemanEnabled,
+      cavemanLevel: s.cavemanLevel,
+      ponytailEnabled: s.ponytailEnabled,
+      ponytailLevel: s.ponytailLevel,
+    });
+  });
+
+  admin.patch("/token-saver", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return jsonError(400, "request body must be JSON", "invalid_request_error");
+    }
+    const entries = Object.entries(body as Record<string, unknown>);
+    if (entries.length === 0) {
+      return jsonError(400, "provide at least one setting", "invalid_request_error");
+    }
+    const patch: {
+      rtkEnabled?: boolean; cavemanEnabled?: boolean; cavemanLevel?: "lite" | "full" | "ultra";
+      ponytailEnabled?: boolean; ponytailLevel?: "lite" | "full" | "ultra";
+    } = {};
+    for (const [key, value] of entries) {
+      if (key === "rtkEnabled" || key === "cavemanEnabled" || key === "ponytailEnabled") {
+        if (typeof value !== "boolean") return jsonError(400, `${key} must be a boolean`, "invalid_request_error");
+        patch[key] = value;
+      } else if (key === "cavemanLevel" || key === "ponytailLevel") {
+        if (value !== "lite" && value !== "full" && value !== "ultra") {
+          return jsonError(400, `${key} must be one of lite, full, ultra`, "invalid_request_error");
+        }
+        patch[key] = value;
+      } else {
+        return jsonError(400, `unknown token saver setting: ${key}`, "invalid_request_error");
+      }
+    }
+    const updated = updateTokenSaverSettings(c.get("db"), patch);
+    return Response.json(updated);
+  });
+
+  // --- Backup export / import --------------------------------------------------
+  admin.post("/backup/export", async (c) => {
+    const body = await c.req.json().catch(() => null) as { password?: unknown } | null;
+    if (body === null || typeof body.password !== "string") {
+      return jsonError(400, "password is required", "invalid_request_error");
+    }
+    const db = c.get("db");
+    const check = await auth.verifyDashboardPassword(db, body.password);
+    if (!check.ok) return jsonError(401, "invalid password", "unauthorized");
+    const backup = exportBackup(db);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return new Response(JSON.stringify(backup), {
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "content-disposition": `attachment; filename="fast-9router-backup-${timestamp}.json"`,
+      },
+    });
+  });
+
+  admin.post("/backup/import", async (c) => {
+    const bodyRead = await readBodyTextLimited(c.req.raw, 10 * 1024 * 1024);
+    if (!bodyRead.ok) return jsonError(413, "backup exceeds 10MB limit", "request_too_large");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bodyRead.text);
+    } catch {
+      return jsonError(400, "backup must be valid JSON", "invalid_request_error");
+    }
+    if (parsed === null || typeof parsed !== "object") {
+      return jsonError(400, "backup must be a JSON object", "invalid_request_error");
+    }
+    const payload = parsed as { password?: unknown; backup?: unknown };
+    if (typeof payload.password !== "string") {
+      return jsonError(400, "password is required", "invalid_request_error");
+    }
+    const db = c.get("db");
+    const check = await auth.verifyDashboardPassword(db, payload.password);
+    if (!check.ok) return jsonError(401, "invalid password", "unauthorized");
+    const validation = validateBackupPayload(db, payload.backup);
+    if (!validation.ok) return jsonError(400, validation.error, "invalid_request_error");
+    const result = importBackup(db, validation.backup);
+    return Response.json({ success: true, counts: result });
+  });
+
+  // --- Codex quota ------------------------------------------------------------
+  admin.get("/quota", async (c) => {
+    const pageRaw = c.req.query("page") ?? "1";
+    const pageSizeRaw = c.req.query("pageSize") ?? "20";
+    const accountStatus = c.req.query("accountStatus") ?? "all";
+    const force = c.req.query("force") ?? "0";
+    if (!/^\d+$/.test(pageRaw) || Number(pageRaw) < 1) return jsonError(400, "page must be a positive integer", "invalid_request_error");
+    if (!/^\d+$/.test(pageSizeRaw) || Number(pageSizeRaw) < 1 || Number(pageSizeRaw) > 50) {
+      return jsonError(400, "pageSize must be between 1 and 50", "invalid_request_error");
+    }
+    if (accountStatus !== "all" && accountStatus !== "active" && accountStatus !== "inactive") {
+      return jsonError(400, "accountStatus must be all, active, or inactive", "invalid_request_error");
+    }
+    if (force !== "0" && force !== "1") {
+      return jsonError(400, "force must be 0 or 1", "invalid_request_error");
+    }
+    const result = await quotaOverview(c.get("db"), {
+      page: Number(pageRaw),
+      pageSize: Number(pageSizeRaw),
+      accountStatus,
+      force: force === "1",
+    });
+    return Response.json(result);
+  });
+
+  admin.get("/quota/:id", async (c) => {
+    const raw = c.req.param("id");
+    if (!raw || !/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+      return jsonError(400, "connection ID must be a positive integer", "invalid_request_error");
+    }
+    const force = c.req.query("force") ?? "0";
+    if (force !== "0" && force !== "1") {
+      return jsonError(400, "force must be 0 or 1", "invalid_request_error");
+    }
+    const connection = getConnection(c.get("db"), Number(raw));
+    if (!connection || connection.provider !== "codex") {
+      return jsonError(404, "Codex connection not found", "not_found");
+    }
+    const snapshot = await quotaSnapshotForConnection(c.get("db"), connection, force === "1");
+    return Response.json(snapshot);
+  });
+
+
+  admin.route("/cli-tools", createCliToolsApp());
 
   app.route("/api/admin", admin);
+
+  // Explicit /login SPA route before the wildcard.
+  app.get("/login", (c) =>
+    serveDashboardFile("/") ??
+    jsonError(404, "not found", "not_found"));
 
   // --- Static dashboard -----------------------------------------------------
   app.get("*", (c) =>

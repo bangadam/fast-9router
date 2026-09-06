@@ -140,7 +140,7 @@ describe("usage aggregation upsert", () => {
     expect(analytics.recent).toEqual([expect.objectContaining({ endpoint: "/v1/chat/completions", status: 200, latencyMs: 42, connectionName: "primary" })]);
     expect(analytics.accounts).toEqual([expect.objectContaining({ model: "px/m1", connectionName: "primary", requests: 1 })]);
     expect(analytics.endpoints).toEqual([expect.objectContaining({ endpoint: "/v1/chat/completions", model: "px/m1", requests: 1 })]);
-    expect(analytics.apiKeys).toEqual([expect.objectContaining({ keyName: "Local (No API Key)", model: "px/m1", requests: 1 })]);
+    expect(analytics.apiKeys).toEqual([expect.objectContaining({ keyCategory: "local", gatewayKeyName: "Local (No API Key)", model: "px/m1", requests: 1 })]);
     const columns = (db.query("PRAGMA table_info(requestUsageRecords)").all() as Array<{ name: string }>).map((column) => column.name);
     expect(columns).not.toContain("prompt");
     expect(columns).not.toContain("response");

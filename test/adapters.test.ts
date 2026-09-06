@@ -5,6 +5,7 @@
 // call per request (no N+1).
 
 import { describe, test, expect, beforeEach } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,7 +48,24 @@ function setup(policy: Parameters<typeof createApp>[4] = {}): { app: App; db: Da
   const dir = mkdtempSync(join(tmpdir(), "fast-9router-ad-"));
   const db = openDatabase(join(dir, "t.db"));
   migrate(db);
-  return { app: createApp(db, undefined, undefined, undefined, policy), db };
+  return { app: createApp(db, undefined, () => "127.0.0.1", undefined, policy), db };
+}
+
+const adminCookies = new WeakMap<App, Promise<string>>();
+async function adminCookie(app: App): Promise<string> {
+  let cookie = adminCookies.get(app);
+  if (!cookie) {
+    cookie = (async () => {
+      const login = await app.fetch(new Request("http://localhost/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1" },
+        body: JSON.stringify({ password: "123456" }),
+      }));
+      return login.headers.get("set-cookie")!.split(";")[0]!;
+    })();
+    adminCookies.set(app, cookie);
+  }
+  return cookie;
 }
 
 beforeEach(() => resetRouterState());
@@ -661,7 +679,7 @@ describe("openai-compatible adapter", () => {
       data: { apiKey: "probe-key", baseUrl: `${upstream.url}/v1`, prefix: "probe", models: ["m1"] },
     });
 
-    const response = await app.fetch(new Request(`http://localhost/api/admin/connections/${connection.id}/test`, { method: "POST" }));
+    const response = await app.fetch(new Request(`http://localhost/api/admin/connections/${connection.id}/test`, { method: "POST", headers: { cookie: await adminCookie(app) } }));
     const result = await response.json();
 
     expect(result.ok).toBe(false);
@@ -736,6 +754,7 @@ describe("anthropic adapter", () => {
 
     const response = await app.fetch(new Request(`http://localhost/api/admin/connections/${connection.id}/test`, {
       method: "POST",
+      headers: { cookie: await adminCookie(app) },
     }));
     const text = await response.text();
 
@@ -759,7 +778,7 @@ describe("anthropic adapter", () => {
       data: { apiKey: "probe-key", baseUrl: `${upstream.url}/v1/messages` },
     });
 
-    const response = await app.fetch(new Request(`http://localhost/api/admin/connections/${connection.id}/test`, { method: "POST" }));
+    const response = await app.fetch(new Request(`http://localhost/api/admin/connections/${connection.id}/test`, { method: "POST", headers: { cookie: await adminCookie(app) } }));
     const result = await response.json();
 
     expect(result.ok).toBe(false);
@@ -818,7 +837,12 @@ describe("validation and errors", () => {
 
   test("gateway auth still enforced on generation endpoints", async () => {
     const { app, db } = setup();
-    db.query("UPDATE settings SET gatewayKey='secret-key-123', gatewayEnforce=1 WHERE id=1").run();
+    const created = db.query(
+      `INSERT INTO gatewayApiKeys (id, name, secretHash, secretPrefix, secretSuffix, isActive, createdAt, updatedAt)
+       VALUES ('11111111-1111-1111-1111-111111111111', 'legacy', ?, 'f9r_', '123', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+    ).run(createHash("sha256").update("secret-key-123").digest("hex"));
+    expect(created.changes).toBe(1);
+    db.query("UPDATE settings SET gatewayEnforce=1 WHERE id=1").run();
     const noKey = await app.fetch(new Request("http://localhost/v1/chat/completions", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "px/m", messages: [] }),
@@ -896,7 +920,7 @@ describe("validation and errors", () => {
     }));
 
     expect((await generate()).status).toBe(200);
-    const tested = await app.fetch(new Request(`http://localhost/api/admin/connections/${primary.id}/test`, { method: "POST" }));
+    const tested = await app.fetch(new Request(`http://localhost/api/admin/connections/${primary.id}/test`, { method: "POST", headers: { cookie: await adminCookie(app) } }));
     expect((await tested.json()).ok).toBe(true);
     db.query("UPDATE providerConnections SET isActive = 0 WHERE id = ?").run(backup.id);
 
@@ -931,7 +955,7 @@ describe("validation and errors", () => {
 
     expect((await generate()).status).toBe(200);
     const patched = await app.fetch(new Request(`http://localhost/api/admin/connections/${primary.id}`, {
-      method: "PATCH", headers: { "content-type": "application/json" },
+      method: "PATCH", headers: { "content-type": "application/json", cookie: await adminCookie(app) },
       body: JSON.stringify({ data: { apiKey: "new-key" } }),
     }));
     expect(patched.status).toBe(200);
@@ -1183,7 +1207,7 @@ describe("codex adapter", () => {
     });
 
     try {
-      const response = await app.fetch(new Request(`http://localhost/api/admin/connections/${connection.id}/test`, { method: "POST" }));
+      const response = await app.fetch(new Request(`http://localhost/api/admin/connections/${connection.id}/test`, { method: "POST", headers: { cookie: await adminCookie(app) } }));
       const result = await response.json();
 
       expect(result.ok).toBe(false);

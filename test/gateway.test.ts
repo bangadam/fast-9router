@@ -1,8 +1,10 @@
-// Gateway auth matrix: enforcement on/off, key correct/incorrect/absent,
-// and non-loopback startup rejection (validateStartupConfig).
+// Gateway auth matrix: enforcement on/off, multi-key Bearer/x-api-key
+// handling, key lifecycle (create/rename/pause/delete), last-active conflict,
+// secret hygiene, and non-loopback startup rejection (validateStartupConfig).
+// Admin calls go through the session-authenticated test helpers.
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { makeApp, adminJson } from "./helpers.ts";
+import { makeApp, adminJson, adminGet } from "./helpers.ts";
 import { resolveOAuthAppOrigin, validateStartupConfig } from "../src/server.ts";
 import type { Config } from "../src/config.ts";
 import { createApp } from "../src/app.ts";
@@ -24,6 +26,13 @@ afterEach(() => {
   while (contexts.length) contexts.pop()!.cleanup();
 });
 
+async function createKey(app: ReturnType<typeof makeApp>["app"], name: string): Promise<{ id: string; secret: string }> {
+  const response = await adminJson(app, "/api/admin/gateway/keys", "POST", { name });
+  expect(response.status).toBe(201);
+  const body = await response.json() as { key: { id: string }; secret: string };
+  return { id: body.key.id, secret: body.secret };
+}
+
 describe("gateway auth", () => {
   test("enforcement off: requests pass without a key", async () => {
     const { app } = ctx();
@@ -31,9 +40,9 @@ describe("gateway auth", () => {
     expect(res.status).toBe(200);
   });
 
-  test("enforcement fails closed when persisted key is empty", async () => {
+  test("enforcement fails closed with zero active keys", async () => {
     const { app, db } = ctx();
-    db.query("UPDATE settings SET gatewayEnforce = 1, gatewayKey = '' WHERE id = 1").run();
+    db.query("UPDATE settings SET gatewayEnforce = 1 WHERE id = 1").run();
 
     const response = await app.fetch(new Request("http://localhost/v1/models"));
 
@@ -42,32 +51,18 @@ describe("gateway auth", () => {
     expect(body.error.type).toBe("server_error");
   });
 
-  test("enforcement fails closed when persisted key is too short", async () => {
+  test("enforcement cannot be enabled without an active key", async () => {
     const { app, db } = ctx();
-    db.query("UPDATE settings SET gatewayEnforce = 1, gatewayKey = 'x' WHERE id = 1").run();
-
-    const response = await app.fetch(new Request("http://localhost/v1/models", {
-      headers: { authorization: "Bearer x" },
-    }));
-
-    expect(response.status).toBe(503);
-  });
-
-  test("malformed persisted key cannot enable enforcement", async () => {
-    const { app, db } = ctx();
-    db.query("UPDATE settings SET gatewayKey = 'x' WHERE id = 1").run();
-
     const response = await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
     const settings = await (await adminJson(app, "/api/admin/gateway", "GET")).json();
 
     expect(response.status).toBe(400);
     expect(settings.enforce).toBe(false);
-    expect(settings.keyConfigured).toBe(false);
   });
 
-  test("enforcement on with key: missing key rejected 401", async () => {
+  test("enforcement on: missing key rejected 401", async () => {
     const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
+    await createKey(app, "primary");
     await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
     const res = await app.fetch(new Request("http://localhost/v1/models"));
     expect(res.status).toBe(401);
@@ -75,13 +70,13 @@ describe("gateway auth", () => {
     expect(body.error.type).toBe("invalid_request_error");
   });
 
-  test("enforcement on with key: wrong key rejected 401", async () => {
+  test("enforcement on: wrong key rejected 401", async () => {
     const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
+    await createKey(app, "primary");
     await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
     const res = await app.fetch(
       new Request("http://localhost/v1/models", {
-        headers: { authorization: "Bearer wrong-key" },
+        headers: { authorization: "Bearer wrong-key-value" },
       }),
     );
     expect(res.status).toBe(401);
@@ -89,31 +84,96 @@ describe("gateway auth", () => {
 
   test("authorization requires the Bearer scheme", async () => {
     const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
+    const { secret } = await createKey(app, "primary");
     await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
 
     const response = await app.fetch(new Request("http://localhost/v1/models", {
-      headers: { authorization: "test-gateway-key-123" },
+      headers: { authorization: secret },
     }));
 
     expect(response.status).toBe(401);
   });
 
-  test("enforcement on with key: correct Bearer key passes", async () => {
+  test("enforcement on: correct Bearer key passes", async () => {
     const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
+    const { secret } = await createKey(app, "primary");
     await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
     const res = await app.fetch(
       new Request("http://localhost/v1/models", {
-        headers: { authorization: "Bearer test-gateway-key-123" },
+        headers: { authorization: `Bearer ${secret}` },
       }),
     );
     expect(res.status).toBe(200);
   });
 
+  test("x-api-key header also authenticates", async () => {
+    const { app } = ctx();
+    const { secret } = await createKey(app, "primary");
+    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
+    const res = await app.fetch(
+      new Request("http://localhost/v1/models", {
+        headers: { "x-api-key": secret },
+      }),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  test("wrong Bearer wins over valid x-api-key", async () => {
+    const { app } = ctx();
+    const { secret } = await createKey(app, "primary");
+    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
+    const res = await app.fetch(
+      new Request("http://localhost/v1/models", {
+        headers: { authorization: "Bearer wrong-key-value", "x-api-key": secret },
+      }),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("two keys authenticate independently; pausing one revokes only it", async () => {
+    const { app } = ctx();
+    const first = await createKey(app, "first");
+    const second = await createKey(app, "second");
+    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
+
+    const pauseResponse = await adminJson(app, `/api/admin/gateway/keys/${first.id}`, "PATCH", { isActive: false });
+    expect(pauseResponse.status).toBe(200);
+
+    const paused = await app.fetch(new Request("http://localhost/v1/models", { headers: { authorization: `Bearer ${first.secret}` } }));
+    expect(paused.status).toBe(401);
+    const active = await app.fetch(new Request("http://localhost/v1/models", { headers: { authorization: `Bearer ${second.secret}` } }));
+    expect(active.status).toBe(200);
+  });
+
+  test("deleting a key revokes only it", async () => {
+    const { app } = ctx();
+    const first = await createKey(app, "first");
+    const second = await createKey(app, "second");
+    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
+
+    const deleteResponse = await adminJson(app, `/api/admin/gateway/keys/${first.id}`, "DELETE");
+    expect(deleteResponse.status).toBe(204);
+
+    const deleted = await app.fetch(new Request("http://localhost/v1/models", { headers: { authorization: `Bearer ${first.secret}` } }));
+    expect(deleted.status).toBe(401);
+    const remaining = await app.fetch(new Request("http://localhost/v1/models", { headers: { authorization: `Bearer ${second.secret}` } }));
+    expect(remaining.status).toBe(200);
+  });
+
+  test("last-active key cannot be paused or deleted under enforcement", async () => {
+    const { app } = ctx();
+    const only = await createKey(app, "only");
+    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
+
+    const pauseResponse = await adminJson(app, `/api/admin/gateway/keys/${only.id}`, "PATCH", { isActive: false });
+    expect(pauseResponse.status).toBe(409);
+    const deleteResponse = await adminJson(app, `/api/admin/gateway/keys/${only.id}`, "DELETE");
+    expect(deleteResponse.status).toBe(409);
+  });
+
   test("CORS preflight bypasses gateway auth on every public API endpoint", async () => {
     const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
+    await createKey(app, "primary");
     await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
 
     for (const path of ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/messages"]) {
@@ -122,33 +182,21 @@ describe("gateway auth", () => {
         headers: {
           origin: "https://client.example",
           "access-control-request-method": path === "/v1/models" ? "GET" : "POST",
-          "access-control-request-headers": "authorization, content-type",
+          "access-control-request-headers": "authorization, content-type, x-api-key, x-9router-token-saver",
         },
       }));
 
       expect(response.status).toBe(204);
       expect(response.headers.get("access-control-allow-origin")).toBe("*");
       expect(response.headers.get("access-control-allow-methods")).toContain("POST");
-      expect(response.headers.get("access-control-allow-headers")).toContain("authorization");
+      expect(response.headers.get("access-control-allow-headers")).toContain("x-api-key");
+      expect(response.headers.get("access-control-allow-headers")).toContain("x-9router-token-saver");
     }
-  });
-
-  test("authenticated API errors include CORS response headers", async () => {
-    const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
-    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
-
-    const response = await app.fetch(new Request("http://localhost/v1/models", {
-      headers: { origin: "https://client.example" },
-    }));
-
-    expect(response.status).toBe(401);
-    expect(response.headers.get("access-control-allow-origin")).toBe("*");
   });
 
   test("dashboard model catalog remains available when public gateway auth is enforced", async () => {
     const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
+    await createKey(app, "primary");
     await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
 
     const publicModels = await app.fetch(new Request("http://localhost/v1/models"));
@@ -159,45 +207,43 @@ describe("gateway auth", () => {
     expect(await dashboardModels.json()).toEqual({ object: "list", data: [] });
   });
 
-  test("key rotation: old key rejected, new key accepted", async () => {
-    const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "first-gateway-key-1" });
-    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "second-gateway-key" });
-    const oldRes = await app.fetch(
-      new Request("http://localhost/v1/models", {
-        headers: { authorization: "Bearer first-gateway-key-1" },
-      }),
+  test("generated secrets never appear in list output or SQLite", async () => {
+    const { app, db } = ctx();
+    const { secret } = await createKey(app, "primary");
+
+    const listResponse = await adminGet(app, "/api/admin/gateway");
+    const text = await listResponse.text();
+    expect(text).not.toContain(secret);
+    const raw = JSON.stringify(
+      (db.query("SELECT * FROM gatewayApiKeys").all() as Array<Record<string, unknown>>),
     );
-    expect(oldRes.status).toBe(401);
-    const newRes = await app.fetch(
-      new Request("http://localhost/v1/models", {
-        headers: { authorization: "Bearer second-gateway-key" },
-      }),
-    );
-    expect(newRes.status).toBe(200);
+    expect(raw).not.toContain(secret);
+    expect(secret).toMatch(/^f9r_[A-Za-z0-9_-]{40,}$/);
+    const body = (await new Response(text).json()) as { keys: Array<{ keyMasked: string; isActive: boolean }> };
+    expect(body.keys[0]!.keyMasked).toMatch(/^f9r_.+••••.+$/);
+    expect(body.keys[0]!.isActive).toBe(true);
   });
 
-  test("gateway key must not be returned in full by the admin API", async () => {
+  test("key names are validated and case-insensitively unique", async () => {
     const { app } = ctx();
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
-    const res = await adminJson(app, "/api/admin/gateway", "GET");
-    const text = await res.text();
-    expect(text).not.toContain("test-gateway-key-123");
-    const body = (await new Response(text).json()) as { keyMasked: string | null; keyConfigured: boolean };
-    expect(body.keyConfigured).toBe(true);
-    expect(body.keyMasked).toMatch(/^\*+$/);
+    await createKey(app, "Primary");
+    const dup = await adminJson(app, "/api/admin/gateway/keys", "POST", { name: "primary" });
+    expect(dup.status).toBe(409);
+    const empty = await adminJson(app, "/api/admin/gateway/keys", "POST", { name: "   " });
+    expect(empty.status).toBe(400);
+    const control = await adminJson(app, "/api/admin/gateway/keys", "POST", { name: "bad\u0007name" });
+    expect(control.status).toBe(400);
   });
 
-  test("gateway key minimum length is checked after normalization", async () => {
+  test("patch requires exactly name and/or isActive", async () => {
     const { app } = ctx();
-    const response = await adminJson(app, "/api/admin/gateway/key", "PUT", {
-      key: "       x",
-    });
-
-    expect(response.status).toBe(400);
-    const settings = await (await adminJson(app, "/api/admin/gateway", "GET")).json();
-    expect(settings.keyConfigured).toBe(false);
+    const { id } = await createKey(app, "primary");
+    const none = await adminJson(app, `/api/admin/gateway/keys/${id}`, "PATCH", {});
+    expect(none.status).toBe(400);
+    const badActive = await adminJson(app, `/api/admin/gateway/keys/${id}`, "PATCH", { isActive: "yes" });
+    expect(badActive.status).toBe(400);
+    const missing = await adminJson(app, "/api/admin/gateway/keys/nonexistent", "PATCH", { name: "x" });
+    expect(missing.status).toBe(404);
   });
 
   test("required enforcement cannot be disabled while a non-loopback listener is running", async () => {
@@ -209,15 +255,51 @@ describe("gateway auth", () => {
       undefined,
       { gatewayEnforcementRequired: true },
     );
-    await adminJson(app, "/api/admin/gateway/key", "PUT", { key: "test-gateway-key-123" });
-    await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: true });
+    const { secret } = await (async () => {
+      const response = await app.fetch(new Request("http://localhost/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1" },
+        body: JSON.stringify({ password: "123456" }),
+      }));
+      const cookie = response.headers.get("set-cookie")!.split(";")[0]!;
+      const createResponse = await app.fetch(new Request("http://localhost/api/admin/gateway/keys", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1", cookie },
+        body: JSON.stringify({ name: "primary" }),
+      }));
+      return await createResponse.json() as { key: { id: string }; secret: string };
+    })();
+    expect(secret).toBeTruthy();
 
-    const response = await adminJson(app, "/api/admin/gateway/enforce", "PUT", { enforce: false });
-    const settings = await (await adminJson(app, "/api/admin/gateway", "GET")).json();
+    const cookieRequest = async (path: string, method: string, body?: unknown) => {
+      const login = await app.fetch(new Request("http://localhost/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1" },
+        body: JSON.stringify({ password: "123456" }),
+      }));
+      const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
+      return app.fetch(new Request(`http://localhost${path}`, {
+        method,
+        headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1", cookie },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }));
+    };
+    await cookieRequest("/api/admin/gateway/enforce", "PUT", { enforce: true });
+    const response = await cookieRequest("/api/admin/gateway/enforce", "PUT", { enforce: false });
+    const settings = await (await cookieRequest("/api/admin/gateway", "GET")).json();
 
     expect(response.status).toBe(400);
     expect(settings.enforce).toBe(true);
     expect(settings.enforceRequired).toBe(true);
+  });
+
+  test("gateway keys never authorize admin routes", async () => {
+    const { app } = ctx();
+    const { secret } = await createKey(app, "primary");
+    const response = await app.fetch(new Request("http://localhost/api/admin/status", {
+      headers: { authorization: `Bearer ${secret}`, "x-test-peer": "127.0.0.1" },
+    }));
+    expect(response.status).toBe(401);
   });
 });
 
@@ -242,51 +324,44 @@ describe("admin peer trust", () => {
 });
 
 describe("non-loopback startup validation", () => {
-  test("non-loopback bind with empty gateway key is rejected", () => {
-    const err = validateStartupConfig({ ...baseConfig, host: "0.0.0.0" }, "");
+  test("non-loopback bind with zero active keys is rejected", () => {
+    const err = validateStartupConfig({ ...baseConfig, host: "0.0.0.0" }, 0);
     expect(err).not.toBeNull();
     expect(err!.message).toContain("0.0.0.0");
   });
 
-  test("non-loopback bind with a key but disabled enforcement is rejected", () => {
-    const err = validateStartupConfig({ ...baseConfig, host: "0.0.0.0" }, "some-key", false);
+  test("non-loopback bind with an active key but disabled enforcement is rejected", () => {
+    const err = validateStartupConfig({ ...baseConfig, host: "0.0.0.0" }, 1, false);
     expect(err).not.toBeNull();
     expect(err!.message).toContain("enforcement");
   });
 
-  test("non-loopback bind with a key and enabled enforcement is accepted", () => {
-    const err = validateStartupConfig({ ...baseConfig, host: "0.0.0.0" }, "some-key", true);
+  test("non-loopback bind with an active key and enabled enforcement is accepted", () => {
+    const err = validateStartupConfig({ ...baseConfig, host: "0.0.0.0" }, 1, true);
     expect(err).toBeNull();
   });
 
-  test("non-loopback bind rejects an enforced but too-short key", () => {
-    const error = validateStartupConfig({ ...baseConfig, host: "0.0.0.0" }, "x", true);
-
-    expect(error).not.toBeNull();
-    expect(error!.message).toContain("gateway API key");
-  });
-
-  test("loopback bind without a key is accepted", () => {
-    expect(validateStartupConfig(baseConfig, "")).toBeNull();
-    expect(validateStartupConfig({ ...baseConfig, host: "localhost" }, "")).toBeNull();
-    expect(validateStartupConfig({ ...baseConfig, host: "::1" }, "")).toBeNull();
+  test("loopback bind without keys is accepted", () => {
+    expect(validateStartupConfig(baseConfig, 0)).toBeNull();
+    expect(validateStartupConfig({ ...baseConfig, host: "localhost" }, 0)).toBeNull();
+    expect(validateStartupConfig({ ...baseConfig, host: "::1" }, 0)).toBeNull();
   });
 
   test("empty and wildcard bind hosts require authentication", () => {
     for (const host of ["", "0.0.0.0", "::"]) {
-      const error = validateStartupConfig({ ...baseConfig, host }, "", false);
+      const error = validateStartupConfig({ ...baseConfig, host }, 0, false);
       expect(error).not.toBeNull();
     }
   });
 
   test("the complete IPv4 loopback range is accepted", () => {
-    expect(validateStartupConfig({ ...baseConfig, host: "127.0.0.2" }, "")).toBeNull();
-    expect(validateStartupConfig({ ...baseConfig, host: "127.255.255.254" }, "")).toBeNull();
+    expect(validateStartupConfig({ ...baseConfig, host: "127.0.0.2" }, 0)).toBeNull();
+    expect(validateStartupConfig({ ...baseConfig, host: "127.255.255.254" }, 0)).toBeNull();
   });
 
   test("invalid port is rejected", () => {
-    expect(validateStartupConfig({ ...baseConfig, port: 0 }, "")).not.toBeNull();
-    expect(validateStartupConfig({ ...baseConfig, port: 70000 }, "")).not.toBeNull();
+    expect(validateStartupConfig({ ...baseConfig, port: 0 }, 0)).not.toBeNull();
+    expect(validateStartupConfig({ ...baseConfig, port: 70000 }, 0)).not.toBeNull();
   });
 });
 

@@ -24,9 +24,9 @@ describe("reset-aware auto-ping", () => {
       provider: "openai", name: "warm", data: { apiKey: "key", baseUrl: "https://example.test/v1", prefix: "px", models: ["m1"], autoPing: true },
     });
     recordConnectionError(db, connection.id, "upstream 429", resetAt);
-    const calls: Array<{ model: unknown; ids: readonly number[] | undefined }> = [];
-    const route: typeof routeGenerationRequest = async (_db, _logger, _endpoint, body, _signal, _timeout, ids) => {
-      calls.push({ model: body.model, ids });
+    const calls: Array<{ model: unknown; ids: readonly number[] | undefined; tokenSaverEnabled?: boolean }> = [];
+    const route: typeof routeGenerationRequest = async (_db, _logger, _endpoint, body, options) => {
+      calls.push({ model: body.model, ids: options?.onlyConnectionIds, tokenSaverEnabled: options?.tokenSaverEnabled });
       return Response.json({ ok: true });
     };
 
@@ -34,7 +34,7 @@ describe("reset-aware auto-ping", () => {
     await runAutoPingTick(db, new Logger("error"), 1_000, 2_000, route);
     await runAutoPingTick(db, new Logger("error"), 1_000, 3_000, route);
 
-    expect(calls).toEqual([{ model: "px/m1", ids: [connection.id] }]);
+    expect(calls).toEqual([{ model: "px/m1", ids: [connection.id], tokenSaverEnabled: false }]);
     expect(getConnection(db, connection.id)?.unavailableUntil).toBeNull();
     expect(getConnection(db, connection.id)?.data.autoPing).toBe(true);
   });

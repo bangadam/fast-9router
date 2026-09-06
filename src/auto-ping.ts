@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { CATALOGS } from "./catalog.ts";
-import { listConnections, updateConnection, type ProviderConnectionWithCooldown } from "./db.ts";
+import { listConnections, updateConnection, INTERNAL_KEY_IDENTITY, type ProviderConnectionWithCooldown } from "./db.ts";
 import { Logger } from "./log.ts";
 import { routeGenerationRequest } from "./router/pipeline.ts";
 
@@ -41,7 +41,12 @@ export async function runAutoPingTick(
         stream: false,
         max_tokens: 1,
         messages: [{ role: "user", content: "ping" }],
-      }, undefined, 15_000, [connection.id], "Internal Auto-ping");
+      }, {
+        upstreamConnectTimeoutMs: 15_000,
+        onlyConnectionIds: [connection.id],
+        tokenSaverEnabled: false,
+        usageKeyIdentity: INTERNAL_KEY_IDENTITY,
+      });
     } else {
       response = Response.json({ error: { message: "no configured model", type: "invalid_request_error" } }, { status: 400 });
     }

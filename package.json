@@ -17,12 +17,23 @@
     "build:dashboard": "vite build --config dashboard/vite.config.ts"
   },
   "dependencies": {
-    "hono": "^4.6.0"
+    "hono": "^4.6.0",
+    "lucide-react": "^1.41.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "smol-toml": "^1.8.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@preact/preset-vite": "^2.10.6",
+    "@tailwindcss/vite": "^4.3.3",
     "@types/bun": "^1.4.0",
-    "preact": "^10.29.8",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.3",
     "typescript": "5.9.3",
     "vite": "^8.2.2"
   },

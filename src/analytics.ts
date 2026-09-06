@@ -116,20 +116,32 @@ export function buildUsageAnalytics(db: Database, period: UsagePeriod, now = Dat
     if (item && (item.lastUsed === null || record.createdAt > item.lastUsed)) item.lastUsed = record.createdAt;
   }
   const endpoints = [...endpointGroups.values()].sort((a, b) => a.endpoint.localeCompare(b.endpoint) || a.model.localeCompare(b.model));
-  const apiKeyGroups = new Map<string, { keyName: string; model: string; provider: string; connectionId: number; connectionName: string; requests: number; failures: number; promptTokens: number; cachedTokens: number; completionTokens: number; lastUsed: number | null; cost: CostBreakdown }>();
+  type ApiKeyGroup = {
+    keyCategory: string; gatewayKeyId: string; gatewayKeyName: string;
+    model: string; provider: string; connectionId: number; connectionName: string;
+    requests: number; failures: number; promptTokens: number; cachedTokens: number;
+    completionTokens: number; lastUsed: number | null; cost: CostBreakdown;
+  };
+  const apiKeyGroups = new Map<string, ApiKeyGroup>();
   for (const row of apiKeyRows) {
-    const key = `${row.keyName}\u0000${row.model}\u0000${row.provider}\u0000${row.connectionId}`;
-    const current = apiKeyGroups.get(key) ?? { keyName: row.keyName, model: row.model, provider: row.provider, connectionId: row.connectionId, connectionName: connections.find((connection) => connection.id === row.connectionId)?.name ?? `Connection ${row.connectionId}`, requests: 0, failures: 0, promptTokens: 0, cachedTokens: 0, completionTokens: 0, lastUsed: null, cost: { input: 0, cached: 0, output: 0, total: 0 } };
+    const key = `${row.keyCategory}\u0000${row.gatewayKeyId}\u0000${row.gatewayKeyName}\u0000${row.model}\u0000${row.provider}\u0000${row.connectionId}`;
+    const current = apiKeyGroups.get(key) ?? {
+      keyCategory: row.keyCategory, gatewayKeyId: row.gatewayKeyId, gatewayKeyName: row.gatewayKeyName,
+      model: row.model, provider: row.provider, connectionId: row.connectionId,
+      connectionName: connections.find((connection) => connection.id === row.connectionId)?.name ?? `Connection ${row.connectionId}`,
+      requests: 0, failures: 0, promptTokens: 0, cachedTokens: 0, completionTokens: 0, lastUsed: null,
+      cost: { input: 0, cached: 0, output: 0, total: 0 },
+    };
     current.requests += row.requests; current.failures += row.failedRequests; current.promptTokens += row.promptTokens ?? 0; current.cachedTokens += row.cachedTokens ?? 0; current.completionTokens += row.completionTokens ?? 0;
     current.cost = costFor(row.model, current.promptTokens, current.cachedTokens, current.completionTokens);
     current.lastUsed = Math.min(now, Math.max(current.lastUsed ?? 0, Date.parse(`${row.hourKey}:59:59.999Z`)));
     apiKeyGroups.set(key, current);
   }
   for (const record of recent) {
-    const item = apiKeyGroups.get(`${record.keyName}\u0000${record.model}\u0000${record.provider}\u0000${record.connectionId}`);
+    const item = apiKeyGroups.get(`${record.keyCategory}\u0000${record.gatewayKeyId}\u0000${record.gatewayKeyName}\u0000${record.model}\u0000${record.provider}\u0000${record.connectionId}`);
     if (item && (item.lastUsed === null || record.createdAt > item.lastUsed)) item.lastUsed = record.createdAt;
   }
-  const apiKeys = [...apiKeyGroups.values()].sort((a, b) => a.keyName.localeCompare(b.keyName) || a.model.localeCompare(b.model));
+  const apiKeys = [...apiKeyGroups.values()].sort((a, b) => a.gatewayKeyName.localeCompare(b.gatewayKeyName) || a.model.localeCompare(b.model));
   const requestsByConnection = new Map<number, number>();
   for (const row of hourly) requestsByConnection.set(row.connectionId, (requestsByConnection.get(row.connectionId) ?? 0) + row.requests);
 

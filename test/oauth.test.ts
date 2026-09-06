@@ -184,7 +184,13 @@ describe("OAuth HTTP routes", () => {
       },
     );
 
-    const start = await app.fetch(new Request(`${appOrigin}/api/admin/oauth/codex/start`));
+    const login = await app.fetch(new Request(`${appOrigin}/api/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-test-peer": "127.0.0.1" },
+      body: JSON.stringify({ password: "123456" }),
+    }));
+    const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
+    const start = await app.fetch(new Request(`${appOrigin}/api/admin/oauth/codex/start`, { headers: { cookie } }));
     expect(start.status).toBe(200);
     const startBody = await start.json();
     const authorizeUrl = new URL(startBody.authorizeUrl);
