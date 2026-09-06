@@ -163,6 +163,47 @@ public/             Prebuilt dashboard assets
 test/               Integration and contract tests
 ```
 
+## Benchmark vs 9Router
+
+Benchmarked 2026-09-06 on Apple M1 Pro (arm64), loopback, `ab` + custom Python LLM harness (`scripts/bench/`). fast-9router on Bun 1.3.14 + Hono; 9router on Node 22 + Next.js 16 standalone, both in production mode.
+
+### Gateway overhead (static, no upstream)
+
+| Metric | fast-9router | 9router | Δ |
+| --- | --- | --- | --- |
+| Cold start → first 200 OK (median ×3) | **69 ms** | 426 ms | 6.2× |
+| RPS `GET /v1/models` (n=2000, c=50) | **15,166** | 627 | 24× |
+| RPS 404 path (pure routing overhead) | **19,008** | 1,269 | 15× |
+| Latency p50 / p95 / p99 | **2 / 5 / 11 ms** | 62 / 108 / 141 ms | ~28× (p50) |
+| Idle RSS | **31 MB** | 56 MB | 1.8× |
+| RSS after sustained load | **54 MB** | 167 MB | 3× |
+| Production dependencies | **5** | 33 | 6.6× |
+| Install size | **177 MB** | 668 MB + 79 MB standalone | 3.8× |
+
+### LLM gateway (identical upstream: surplus `glm-5.3`)
+
+Both gateways proxied the exact same upstream API and key (9router's `dewa-glm` combo resolves to `surplus/glm-5.3`). Upstream latency dominates total time; differences below are gateway-side.
+
+| Metric | fast-9router | 9router | Winner |
+| --- | --- | --- | --- |
+| Stream TTFT (first SSE token) | **2,584–2,655 ms** | 4,585–7,469 ms | **fast-9router ~2× faster** |
+| 4 parallel requests (per-req) | **2,507–3,475 ms** | 4,723–5,330 ms | **fast-9router ~40% faster** |
+| SSE granularity | 25–28 events (per-token) | 12 events (batched) | fast-9router |
+| Non-stream content-type | ✅ `application/json` | ⚠️ `text/event-stream` + `data: [DONE]` glued to the JSON body | fast-9router ([OI]-compliant) |
+| Tool call correctness | ✅ valid | ✅ valid | tie |
+| Usage accounting | ✅ 3/3 | ✅ 3/3 | tie |
+| RSS under LLM traffic | **43 MB** | 83 MB | fast-9router |
+| Non-stream median latency | 2,315 ms | 1,815 ms | tie (within upstream variance) |
+
+### Conclusions
+
+- fast-9router wins as an LLM gateway: 2× faster TTFT, 40% faster under concurrency, per-token streaming, [OI]-compliant non-stream responses, half the memory.
+- 9router's non-stream path is protocol-dirty (SSE content-type + `[DONE]` sentinel appended to JSON) — breaks strict [OI] SDK clients.
+- 9router's edge is surrounding features (multi-provider combos with silent fallback, full dashboard), not gateway performance.
+- Upstream is the true bottleneck for total latency; gateway choice matters for time-to-first-token and concurrent fan-out.
+
+Reproduce with `scripts/bench/bench.sh` (static) and `python3 scripts/bench/llm-bench2.py all` (LLM).
+
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md). Security issues follow [SECURITY.md](SECURITY.md).
